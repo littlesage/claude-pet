@@ -139,6 +139,91 @@ def perchable_windows(exclude_hwnd, exclude_pid=None):
     return found
 
 
+TERMINAL_APPS = ("windowsterminal", "conhost", "cmd", "powershell", "pwsh",
+                 "wezterm", "alacritty", "hyper", "mintty", "code")
+
+
+def _process_name(pid):
+    try:
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, pid)      # QUERY_LIMITED_INFORMATION
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(512)
+            size = wintypes.DWORD(512)
+            if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                return buf.value.rsplit("\\", 1)[-1].lower()
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        pass
+    return ""
+
+
+def find_session_window(session_name):
+    """세션 이름이 제목에 든 터미널 창을 찾는다.
+
+    세션마다 터미널 창이 따로 뜨고 제목이 곧 세션 이름이라, 이름만으로 찾아갈 수 있다.
+    제목에는 상태 표시 기호가 붙으므로 포함 관계로 본다.
+    """
+    if not session_name:
+        return None
+    want = session_name.strip()
+    hit = []
+
+    def cb(hwnd, _):
+        if not user32_is_shown(hwnd):
+            return True
+        n = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+        if not n:
+            return True
+        buf = ctypes.create_unicode_buffer(n + 1)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buf, n + 1)
+        if want not in buf.value:
+            return True
+        pid = wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if any(t in _process_name(pid.value) for t in TERMINAL_APPS):
+            hit.append(hwnd)
+        return True
+
+    try:
+        ctypes.windll.user32.EnumWindows(_WNDENUMPROC(cb), 0)
+    except Exception:
+        return None
+    return hit[0] if hit else None
+
+
+def user32_is_shown(hwnd):
+    u = ctypes.windll.user32
+    return bool(u.IsWindowVisible(hwnd)) and not u.IsIconic(hwnd)
+
+
+def focus_window(hwnd):
+    """다른 앱의 창을 앞으로 가져온다.
+
+    윈도우는 포그라운드를 함부로 못 뺏게 막아 두어서, 입력 큐를 잠시 붙이고
+    그래도 안 되면 알트탭과 같은 경로로 한 번 더 시도한다.
+    """
+    if not hwnd:
+        return False
+    u = ctypes.windll.user32
+    try:
+        u.ShowWindow(hwnd, 9)                        # SW_RESTORE
+        cur = ctypes.windll.kernel32.GetCurrentThreadId()
+        tid = u.GetWindowThreadProcessId(hwnd, None)
+        u.AttachThreadInput(cur, tid, True)
+        u.BringWindowToTop(hwnd)
+        ok = u.SetForegroundWindow(hwnd)
+        u.AttachThreadInput(cur, tid, False)
+        if not ok or u.GetForegroundWindow() != hwnd:
+            u.SwitchToThisWindow(hwnd, True)
+        return u.GetForegroundWindow() == hwnd
+    except Exception:
+        return False
+
+
 def work_area_at(x, y):
     """(x, y)가 속한 모니터의 작업 영역 — 작업표시줄을 뺀 사각형.
 
@@ -541,6 +626,7 @@ class ClaudePet:
 
         self.queue = []           # 대기 중인 이벤트 문자열
         self.bubble_text = None
+        self.bubble_session = ""
         self.bubble_until = 0.0
 
         self.t0 = time.time()
@@ -996,7 +1082,7 @@ class ClaudePet:
                 evt = json.loads(line)
             except Exception:
                 continue
-            self._notify(self._format(evt))
+            self._notify(*self._format(evt))
 
     @staticmethod
     def _format(evt):
@@ -1015,10 +1101,10 @@ class ClaudePet:
         if proj.lower() == home.lower():
             proj = ""  # 홈 디렉토리는 프로젝트명으로 의미 없음
         tag = name or proj
-        return f"[{tag}] {msg}" if tag else msg
+        return (f"[{tag}] {msg}" if tag else msg), name
 
-    def _notify(self, text):
-        self.queue.append(text)
+    def _notify(self, text, session=""):
+        self.queue.append((text, session))
         self.bounce_t = self.last_active = time.time()
         self.wander_to = None            # 알림이 왔으면 산책은 멈추고 알린다
         self.sit_action = None
@@ -1033,10 +1119,11 @@ class ClaudePet:
 
     def _show_next(self):
         if self.queue:
-            self.bubble_text = self.queue.pop(0)
+            self.bubble_text, self.bubble_session = self.queue.pop(0)
             self.bubble_until = time.time() + BUBBLE_SECONDS
         else:
             self.bubble_text = None
+            self.bubble_session = ""
 
     # ---------- 입력 ----------
     def _on_press(self, e):
@@ -1069,7 +1156,13 @@ class ClaudePet:
             self._save_config()
         else:
             if self.bubble_text is not None:
-                self._show_next()  # 클릭 = 현재 말풍선 넘기기
+                # 알림을 클릭하면 그 세션의 터미널 창으로 데려다준다.
+                # 클릭 처리가 끝나기 전에 창을 바꾸면 펫이 도로 앞으로 나오므로 한 박자 늦춘다.
+                if self.config.get("click_focus", True) and self.bubble_session:
+                    hwnd = find_session_window(self.bubble_session)
+                    if hwnd:
+                        self.root.after(140, lambda h=hwnd: focus_window(h))
+                self._show_next()
             else:
                 self.bounce_t = time.time()  # 심심할 때 클릭하면 폴짝
         self._press = None
