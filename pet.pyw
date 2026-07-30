@@ -31,7 +31,8 @@ CLAY_DARK = "#b85c3f"
 BLUSH = "#eda88f"
 CREAM = "#fdf8f1"
 INK = "#2d2318"
-BADGE = "#e5484d"
+BADGE = "#e5484d"          # 미확인 알림 뱃지
+BADGE_WAIT = "#a81d16"     # 입력 대기가 섞였을 때 (더 진하게)
 
 VECTOR_SIZE = 104          # 내장 벡터 펫이 차지하는 정사각 크기
 BUBBLE_ZONE = 150          # 말풍선용 상단 여백
@@ -640,9 +641,10 @@ class ClaudePet:
         except Exception:
             self._hwnd = 0
 
-        self.queue = []           # 대기 중인 이벤트 문자열
+        self.unread = []          # 아직 확인하지 않은 알림 (클릭해야 지워진다)
         self.bubble_text = None
         self.bubble_session = ""
+        self.bubble_index = -1
         self.bubble_until = 0.0
 
         self.t0 = time.time()
@@ -1006,7 +1008,7 @@ class ClaudePet:
             return False
         if not self.config.get("wander", True):
             return False
-        if (now - self.bounce_t) < 2.0 or self.queue or self.bubble_text:
+        if (now - self.bounce_t) < 2.0 or self.unread or self.bubble_text:
             return False
         if (now - self.last_active) > IDLE_LIE_SECONDS:   # 누워 있으면 그대로 둔다
             return False
@@ -1065,7 +1067,7 @@ class ClaudePet:
             return False
         if self._press or self._anim or self.wander_to is not None:
             return False
-        if (now - self.bounce_t) < 2.0 or self.queue or self.bubble_text:
+        if (now - self.bounce_t) < 2.0 or self.unread or self.bubble_text:
             return False
         return (now - self.last_active) < IDLE_SLEEP_SECONDS
 
@@ -1143,7 +1145,7 @@ class ClaudePet:
                 evt = json.loads(line)
             except Exception:
                 continue
-            self._notify(*self._format(evt))
+            self._notify(*self._format(evt))   # (문구, 세션, 종류)
 
     @staticmethod
     def _format(evt):
@@ -1162,10 +1164,10 @@ class ClaudePet:
         if proj.lower() == home.lower():
             proj = ""  # 홈 디렉토리는 프로젝트명으로 의미 없음
         tag = name or proj
-        return (f"[{tag}] {msg}" if tag else msg), name
+        return (f"[{tag}] {msg}" if tag else msg), name, etype
 
-    def _notify(self, text, session=""):
-        self.queue.append((text, session))
+    def _notify(self, text, session="", kind=""):
+        self.unread.append({"text": text, "session": session, "kind": kind})
         self.bounce_t = self.last_active = time.time()
         self.wander_to = None            # 알림이 왔으면 산책은 멈추고 알린다
         self.sit_action = None
@@ -1178,13 +1180,34 @@ class ClaudePet:
         if self.bubble_text is None:
             self._show_next()
 
-    def _show_next(self):
-        if self.queue:
-            self.bubble_text, self.bubble_session = self.queue.pop(0)
+    def _show_next(self, after=None):
+        """미확인 목록에서 다음 알림을 말풍선에 올린다. 목록에서 빼지는 않는다."""
+        pos = 0
+        if after is not None:
+            pos = min(after, len(self.unread) - 1) if self.unread else 0
+        if self.unread:
+            item = self.unread[max(0, pos)]
+            self.bubble_text = item["text"]
+            self.bubble_session = item["session"]
+            self.bubble_index = self.unread.index(item)
             self.bubble_until = time.time() + BUBBLE_SECONDS
         else:
             self.bubble_text = None
             self.bubble_session = ""
+            self.bubble_index = -1
+
+    def _hide_bubble(self):
+        """말풍선만 걷는다. 확인 처리는 아니어서 미확인 목록에는 그대로 남는다."""
+        self.bubble_text = None
+        self.bubble_session = ""
+        self.bubble_index = -1
+
+    def _mark_read(self):
+        """지금 보고 있는 알림 한 건을 확인 처리한다."""
+        if 0 <= self.bubble_index < len(self.unread):
+            self.unread.pop(self.bubble_index)
+            return self.bubble_index
+        return 0
 
     # ---------- 입력 ----------
     def _on_press(self, e):
@@ -1217,7 +1240,7 @@ class ClaudePet:
             self._save_config()
         else:
             if self.bubble_text is not None:
-                # 알림을 클릭하면 그 세션의 터미널 창으로 데려다준다.
+                # 보고 있던 알림을 확인 처리하고 그 세션 창으로 데려다준다.
                 # 클릭 처리가 끝나기 전에 창을 바꾸면 펫이 도로 앞으로 나오므로 한 박자 늦춘다.
                 if self.config.get("click_focus", True) and self.bubble_session:
                     hwnd = find_session_window(self.bubble_session)
@@ -1226,7 +1249,9 @@ class ClaudePet:
                             focus_window(h)
                             self._highlight_window(h)
                         self.root.after(140, go)
-                self._show_next()
+                self._show_next(self._mark_read())
+            elif self.unread:
+                self._show_next()            # 뱃지만 남아 있으면 먼저 내용을 보여준다
             else:
                 self.bounce_t = time.time()  # 심심할 때 클릭하면 폴짝
         self._press = None
@@ -1264,7 +1289,7 @@ class ClaudePet:
         self._save_config()
 
     def _clear_all(self):
-        self.queue.clear()
+        self.unread.clear()
         self.bubble_text = None
 
     def _force_reload(self):
@@ -1324,7 +1349,7 @@ class ClaudePet:
                 self.blink_until = now + 0.15
                 self.next_blink = now + random.uniform(2.5, 6.0)
             if self.bubble_text is not None and now >= self.bubble_until:
-                self._show_next()
+                self._hide_bubble()      # 시간이 지나면 말풍선만 걷고 뱃지는 남긴다
             self._draw()
         except Exception:
             # 그리기 한 프레임이 죽어도 펫 자체는 계속 살아 있어야 한다
@@ -1354,14 +1379,8 @@ class ClaudePet:
         else:
             self._draw_vector(c, cy, t, now)
 
-        # 미확인 알림 뱃지
-        if self.queue:
-            bx = self.pet_cx + self.pet_w // 2 - 8
-            by = cy - self.pet_h // 2 + 8
-            c.create_oval(bx - 11, by - 11, bx + 11, by + 11,
-                          fill=BADGE, outline="white", width=2)
-            c.create_text(bx, by, text=str(min(len(self.queue), 9)),
-                          fill="white", font=("Malgun Gothic", 9, "bold"))
+        if self.unread:
+            self._draw_badge(c, cy)
 
         if self.bubble_text is not None:
             area = work_area_at(self.root.winfo_x() + self.W // 2,
@@ -1476,6 +1495,27 @@ class ClaudePet:
         for dx in (-23, 23):
             c.create_oval(self.pet_cx + dx - 6, cy + 4, self.pet_cx + dx + 6, cy + 11,
                           fill=BLUSH, outline="")
+
+    def _draw_badge(self, c, cy):
+        """미확인 알림 표시 — 몸 오른쪽 위.
+
+        한 곳에서만 왔으면 느낌표, 여러 곳이면 그 수를 적는다. 세는 단위는 알림 건수가
+        아니라 세션 수다. 한 세션이 여러 번 부른 것보다 몇 군데서 부르는지가 중요하다.
+        입력을 기다리는 알림이 섞여 있으면 색을 진하게 해 급한 쪽을 알린다.
+        """
+        sessions = {u["session"] for u in self.unread}
+        count = len(sessions)
+        label = "!" if count <= 1 else ("9+" if count > 9 else str(count))
+        waiting = any(u["kind"] == "notification" for u in self.unread)
+        fill = BADGE_WAIT if waiting else BADGE
+
+        bx = self.pet_cx + self.pet_w // 2 - 8
+        by = cy - self.pet_h // 2 + 8
+        r = 11 if len(label) < 2 else 13
+        c.create_oval(bx - r, by - r, bx + r, by + r,
+                      fill=fill, outline="white", width=2)
+        c.create_text(bx, by + (0 if label != "!" else -1), text=label,
+                      fill="white", font=("Malgun Gothic", 10 if r > 11 else 11, "bold"))
 
     def _draw_bubble(self, c, cy, below=False):
         # 창 끝이 아니라 몸을 기준으로 잡아 짧은 문구도 머리 바로 옆에 붙는다.
