@@ -37,6 +37,9 @@ VECTOR_SIZE = 104          # 내장 벡터 펫이 차지하는 정사각 크기
 BUBBLE_ZONE = 150          # 말풍선용 상단 여백
 BUBBLE_SECONDS = 12
 BUBBLE_GAP = 6             # 말풍선 꼬리와 몸 사이 간격(px)
+HL_WIDTH = 5               # 불러낸 창을 감싸는 테두리 굵기
+HL_MS = 900                # 테두리가 머무는 시간
+HL_STEPS = 18              # 사라지는 단계 수
 SINGLETON_PORT = 48620
 SNAP_DIST = 70             # 이 거리 안이면 가장자리·창 위에 달라붙는다
 SNAP_FRAMES = 7            # 달라붙는 동안의 프레임 수
@@ -222,6 +225,19 @@ def focus_window(hwnd):
         return u.GetForegroundWindow() == hwnd
     except Exception:
         return False
+
+
+def make_click_through(hwnd):
+    """이 창은 마우스를 받지 않고 아래로 흘려보낸다."""
+    try:
+        u = ctypes.windll.user32
+        GWL_EXSTYLE = -20
+        WS_EX_LAYERED, WS_EX_TRANSPARENT, WS_EX_NOACTIVATE = 0x80000, 0x20, 0x8000000
+        style = u.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        u.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                         style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE)
+    except Exception:
+        pass
 
 
 def work_area_at(x, y):
@@ -867,6 +883,51 @@ class ClaudePet:
             self.config["snap_y"] = None
         return x, y
 
+    def _highlight_window(self, hwnd):
+        """앞으로 불러낸 창 둘레를 잠깐 빛나게 해 어느 창인지 알려준다."""
+        rect = window_rect(hwnd)
+        if not rect or not self.config.get("click_highlight", True):
+            return
+        left, top, right, bottom = rect
+        pad = HL_WIDTH + 2
+        w, h = right - left + pad * 2, bottom - top + pad * 2
+        if w < 40 or h < 40 or w > 12000 or h > 12000:
+            return
+        try:
+            box = tk.Toplevel(self.root)
+            box.overrideredirect(True)
+            box.attributes("-topmost", True)
+            box.attributes("-transparentcolor", TRANSPARENT)
+            box.configure(bg=TRANSPARENT)
+            cv = tk.Canvas(box, width=w, height=h, bg=TRANSPARENT, highlightthickness=0)
+            cv.pack()
+            half = HL_WIDTH / 2
+            cv.create_rectangle(half, half, w - half, h - half,
+                                outline=CLAY, width=HL_WIDTH)
+            cv.create_rectangle(half + HL_WIDTH, half + HL_WIDTH,
+                                w - half - HL_WIDTH, h - half - HL_WIDTH,
+                                outline=CREAM, width=1)
+            box.geometry(f"{w}x{h}+{left - pad}+{top - pad}")
+            box.update_idletasks()
+            make_click_through(int(box.wm_frame(), 16))
+        except Exception:
+            return
+
+        def fade(step=0):
+            if step >= HL_STEPS:
+                box.destroy()
+                return
+            # 잠깐 그대로 뒀다가 서서히 지운다
+            hold = HL_STEPS // 3
+            a = 1.0 if step < hold else 1.0 - (step - hold) / (HL_STEPS - hold)
+            try:
+                box.attributes("-alpha", max(0.0, a))
+                self.root.after(HL_MS // HL_STEPS, lambda: fade(step + 1))
+            except Exception:
+                pass
+
+        fade()
+
     def _glide_to(self, x, y):
         """스냅 위치까지 부드럽게 미끄러져 붙는다."""
         cx = self.root.winfo_x()
@@ -1161,7 +1222,10 @@ class ClaudePet:
                 if self.config.get("click_focus", True) and self.bubble_session:
                     hwnd = find_session_window(self.bubble_session)
                     if hwnd:
-                        self.root.after(140, lambda h=hwnd: focus_window(h))
+                        def go(h=hwnd):
+                            focus_window(h)
+                            self._highlight_window(h)
+                        self.root.after(140, go)
                 self._show_next()
             else:
                 self.bounce_t = time.time()  # 심심할 때 클릭하면 폴짝
