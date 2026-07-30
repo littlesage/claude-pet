@@ -1,0 +1,12 @@
+# 실행 중 생기는 것들
+config.json
+events.jsonl
+pet_error.log
+__pycache__/
+*.pyc
+
+# 작업 부산물
+tmp/
+tmp_hang_fix/
+*.bak
+assets/_hang_nobar/
