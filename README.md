@@ -17,7 +17,7 @@
 ## 설치
 
 ```powershell
-git clone https://github.com/<your-account>/claude-pet.git
+git clone https://github.com/littlesage/claude-pet.git
 cd claude-pet
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
