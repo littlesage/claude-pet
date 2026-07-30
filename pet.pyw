@@ -599,8 +599,9 @@ class ClaudePet:
         pet_h = base.height if base else VECTOR_SIZE
         for sp in self.sprites.values():
             pet_w, pet_h = max(pet_w, sp.width), max(pet_h, sp.height)
-        for sp, _ in self.sit_actions.values():
-            pet_w, pet_h = max(pet_w, sp.width), max(pet_h, sp.height)
+        for variants, _ in self.sit_actions.values():
+            for sp in variants:
+                pet_w, pet_h = max(pet_w, sp.width), max(pet_h, sp.height)
         self.pet_w, self.pet_h = pet_w, pet_h
         self.W = max(330, pet_w + 80)   # 말풍선이 들어갈 폭까지 확보
         # 말풍선 자리를 위아래 양쪽에 둔다. 창 꼭대기에 앉으면 위쪽이 화면 밖으로
