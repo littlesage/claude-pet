@@ -12,6 +12,7 @@
 
 사용: python question_board.py  (또는 QuestionBoard.bat)
 """
+import glob
 import json
 import os
 import re
@@ -80,6 +81,54 @@ def job_state(session_id):
             return json.load(f)
     except Exception:
         return {}
+
+
+def transcript_file(session_id):
+    """sessionId로 실제 트랜스크립트 jsonl을 찾는다(전 프로젝트 glob)."""
+    for d in glob.glob(os.path.join(PROJECTS_DIR, "*")):
+        p = os.path.join(d, session_id + ".jsonl")
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _content_text(msg):
+    content = (msg or {}).get("content")
+    if isinstance(content, list):
+        return "\n".join(c.get("text", "") for c in content
+                         if isinstance(c, dict) and c.get("type") == "text").strip()
+    return (content or "").strip() if isinstance(content, str) else ""
+
+
+def transcript_turns(session_id, limit=12):
+    """최근 user/assistant 턴을 [{role, text}] 로. 뒤에서부터 읽어 대용량 대응."""
+    path = transcript_file(session_id)
+    if not path:
+        return []
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - 2 * 1024 * 1024))
+            lines = f.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    turns = []
+    for line in reversed(lines):
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        role = o.get("type")
+        if role not in ("user", "assistant"):
+            continue
+        text = _content_text(o.get("message"))
+        # 시스템 리마인더·훅 잡음 제거
+        if not text or text.startswith("<") or "system-reminder" in text[:40]:
+            continue
+        turns.append({"role": role, "text": text})
+        if len(turns) >= limit:
+            break
+    return list(reversed(turns))
 
 
 # ---------- 요약 ----------
@@ -269,6 +318,11 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif self.path == "/api/state":
             self._json(state_payload())
+        elif self.path.startswith("/api/transcript"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            sid = (q.get("sid") or [""])[0]
+            self._json({"turns": transcript_turns(sid)})
         else:
             self._json({"error": "not found"}, 404)
 
@@ -332,12 +386,26 @@ h2 { font-size:13px; color:var(--sub); margin:18px 0 8px; letter-spacing:.5px; }
 .choice:hover { border-color:var(--accent); color:var(--accent); }
 .raw { font-size:11.5px; color:var(--sub); white-space:pre-wrap; max-height:70px;
   overflow:auto; border-top:1px dashed var(--line); margin-top:6px; padding-top:6px; }
-.replybox { display:flex; gap:6px; margin-top:8px; }
-.replybox textarea { flex:1; border:1px solid var(--line); border-radius:6px; padding:7px 9px;
-  font:inherit; font-size:13px; background:var(--bg); color:var(--ink); resize:vertical; min-height:36px; }
+.actions { display:flex; gap:6px; margin-top:8px; align-items:center; flex-wrap:wrap; }
+.actions .meta { flex:1; }
+.replybox { margin-top:8px; }
+.replybox textarea { width:100%; border:1px solid var(--line); border-radius:6px; padding:8px 10px;
+  font:inherit; font-size:13px; background:var(--bg); color:var(--ink); resize:vertical; min-height:52px; }
+.replybox .row { display:flex; gap:6px; margin-top:6px; align-items:center; }
+.replybox .hint { flex:1; font-size:11px; color:var(--sub); }
 button { background:var(--accent); color:#fff; border:none; border-radius:6px;
   padding:7px 14px; font-size:12.5px; cursor:pointer; }
 button.ghost { background:none; color:var(--sub); border:1px solid var(--line); }
+button:disabled { opacity:.5; cursor:default; }
+.detail { margin-top:8px; border-top:1px dashed var(--line); padding-top:8px; display:none; }
+.detail.on { display:block; }
+.turn { margin:6px 0; font-size:12.5px; line-height:1.5; }
+.turn .who { font-weight:700; font-size:11px; color:var(--sub); display:block; margin-bottom:2px; }
+.turn.user .who::before { content:'🧑 나'; }
+.turn.assistant .who::before { content:'🤖 세션'; }
+.turn .body { white-space:pre-wrap; border-left:2px solid var(--line); padding-left:8px;
+  max-height:220px; overflow:auto; }
+.turn.user .body { border-left-color:var(--accent); }
 .empty { color:var(--sub); font-size:13px; padding:14px; text-align:center; }
 .toast { position:fixed; bottom:14px; left:50%; transform:translateX(-50%);
   background:var(--ink); color:var(--bg); border-radius:8px; padding:9px 18px;
@@ -349,6 +417,8 @@ button.ghost { background:none; color:var(--sub); border:1px solid var(--line); 
 <div id="root" class="empty">불러오는 중…</div>
 <div id="toast" class="toast"></div>
 <script>
+var ui = {};  // sid -> {detail:bool, reply:bool, text:''}  (갱신 넘어 상태 보존)
+function st(sid){ return ui[sid] || (ui[sid]={detail:false,reply:false,text:''}); }
 function esc(s){ return (s||'').replace(/[&<>"]/g, function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
 function ago(ts){ var m=Math.floor((Date.now()/1000-ts)/60);
@@ -366,11 +436,25 @@ function card(row){
       return '<span class="choice" data-copy="'+esc(x)+'">'+esc(x)+'</span>';}).join('')+'</div>'; }
     h+='<div class="raw">'+esc(c.raw_tail)+'</div>'; }
   else { h+='<div class="summary" style="color:var(--sub)">요약 대기 중 (다음 훅 이벤트에서 생성)</div>'; }
+  // 액션 바: 상세 열기(모든 세션) + 답장(질문 카드)
+  h+='<div class="actions">';
+  h+='<span class="meta"><code>'+row.session_id.slice(0,8)+'</code></span>';
+  h+='<button class="ghost detailbtn">상세 ▾</button>';
+  if(kind==='question') h+='<button class="replybtn">답장</button>';
+  h+='<button class="ghost dismiss">닫기</button>';
+  h+='</div>';
+  // 답장 입력창 (질문 카드, 기본 숨김)
   if(kind==='question'){
-    var loc = isBg ? 'agent view에서 이 세션 열어(Enter) 답장' : '해당 터미널에서 답장';
-    h+='<div class="meta" style="margin-top:6px">'+loc
-      +' · <code>'+row.session_id.slice(0,8)+'</code>'
-      +' <button class="ghost dismiss" style="margin-left:8px">닫기</button></div>'; }
+    var canSend = isBg;
+    h+='<div class="replybox" style="display:none">';
+    h+='<textarea placeholder="'+(canSend?'답장을 입력하면 이 세션에 바로 전송됩니다':'인터랙티브 세션 — 아래 안내대로 해당 터미널에서')+'"></textarea>';
+    h+='<div class="row">';
+    if(canSend){ h+='<span class="hint">Enter 전송 · Shift+Enter 줄바꿈</span><button class="send">전송</button>'; }
+    else { h+='<span class="hint">이 세션은 별도 터미널 창에 있습니다. 그 창에서 직접 입력하세요.</span>'; }
+    h+='</div></div>';
+  }
+  // 상세(전체 대화) 영역
+  h+='<div class="detail"><div class="detailbody meta">불러오는 중…</div></div>';
   return h+'</div>';
 }
 function render(d){
@@ -383,15 +467,69 @@ function render(d){
   h+=qs.length?qs.map(card).join(''):'<div class="empty">지금 나를 기다리는 질문이 없다 🎉</div>';
   h+='<h2>그 외 세션 ('+rest.length+')</h2>'+rest.map(card).join('');
   root.innerHTML=h;
+  // 선택지 칩 → 답장창에 채우기(있으면) 또는 복사
   root.querySelectorAll('.choice').forEach(function(el){ el.onclick=function(){
-    navigator.clipboard&&navigator.clipboard.writeText(el.dataset.copy);
-    toast('복사됨: '+el.dataset.copy+' — agent view에 붙여넣어 답장'); };});
+    var ta=el.closest('.card').querySelector('.replybox textarea');
+    if(ta){ el.closest('.card').querySelector('.replybox').style.display='block';
+      ta.value=el.dataset.copy; ta.focus(); }
+    else { navigator.clipboard&&navigator.clipboard.writeText(el.dataset.copy); toast('복사됨: '+el.dataset.copy); } };});
+  // 답장 버튼 → 입력창 토글
+  root.querySelectorAll('.replybtn').forEach(function(el){ el.onclick=function(){
+    var cd=el.closest('.card'), box=cd.querySelector('.replybox'), s=st(cd.dataset.sid);
+    s.reply=!s.reply; box.style.display=s.reply?'block':'none';
+    if(s.reply){ var ta=box.querySelector('textarea'); if(ta) ta.focus(); } };});
+  // 전송
+  root.querySelectorAll('.send').forEach(function(el){ el.onclick=function(){ sendReply(el.closest('.card')); };});
+  root.querySelectorAll('.replybox textarea').forEach(function(ta){
+    ta.oninput=function(){ st(ta.closest('.card').dataset.sid).text=ta.value; };
+    ta.onkeydown=function(e){
+      if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); sendReply(ta.closest('.card')); } };});
+  // 상세 토글
+  root.querySelectorAll('.detailbtn').forEach(function(el){ el.onclick=function(){
+    var cd=el.closest('.card'), s=st(cd.dataset.sid);
+    s.detail=!s.detail; applyDetail(cd, el); };});
+  // 닫기
   root.querySelectorAll('.dismiss').forEach(function(el){ el.onclick=function(){
+    var sid=el.closest('.card').dataset.sid; delete ui[sid];
     fetch('/api/dismiss',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({session_id:el.closest('.card').dataset.sid})}).then(load);};});
+      body:JSON.stringify({session_id:sid})}).then(load);};});
+  // 갱신 후 열림 상태 복원
+  root.querySelectorAll('.card').forEach(function(cd){
+    var s=ui[cd.dataset.sid]; if(!s) return;
+    if(s.reply){ var box=cd.querySelector('.replybox');
+      if(box){ box.style.display='block'; var ta=box.querySelector('textarea'); if(ta&&s.text) ta.value=s.text; } }
+    if(s.detail){ applyDetail(cd, cd.querySelector('.detailbtn')); }
+  });
 }
-function load(){ fetch('/api/state').then(function(r){return r.json();}).then(render)
-  .catch(function(){ document.getElementById('root').textContent='서버 응답 없음'; }); }
+function applyDetail(cd, btn){
+  var det=cd.querySelector('.detail');
+  if(!st(cd.dataset.sid).detail){ det.classList.remove('on'); if(btn) btn.textContent='상세 ▾'; return; }
+  det.classList.add('on'); if(btn) btn.textContent='상세 ▴';
+  var body=det.querySelector('.detailbody'); body.textContent='불러오는 중…';
+  fetch('/api/transcript?sid='+encodeURIComponent(cd.dataset.sid)).then(function(r){return r.json();})
+    .then(function(d){
+      if(!d.turns||!d.turns.length){ body.innerHTML='<span class="meta">대화 기록을 찾지 못했습니다(짧은 세션이거나 트랜스크립트 없음).</span>'; return; }
+      body.innerHTML=d.turns.map(function(t){
+        return '<div class="turn '+t.role+'"><span class="who"></span><div class="body">'+esc(t.text)+'</div></div>'; }).join('');
+    }).catch(function(){ body.textContent='불러오기 실패'; });
+}
+function sendReply(cd){
+  var ta=cd.querySelector('.replybox textarea'), btn=cd.querySelector('.send');
+  if(!ta||!ta.value.trim()) return toast('내용을 입력하세요');
+  if(btn){ btn.disabled=true; btn.textContent='전송 중…'; }
+  fetch('/api/reply',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({session_id:cd.dataset.sid,text:ta.value})})
+    .then(function(r){return r.json();}).then(function(r){
+      toast(r.ok?'전송됨 — 세션이 이어서 작업합니다':'전송 실패: '+r.detail);
+      if(btn){ btn.disabled=false; btn.textContent='전송'; }
+      if(r.ok) load(); });
+}
+function load(){
+  // 답장 입력 중이면 이번 갱신 보류(입력 내용·포커스 보호)
+  var ae=document.activeElement;
+  if(ae && ae.tagName==='TEXTAREA') return;
+  fetch('/api/state').then(function(r){return r.json();}).then(render)
+    .catch(function(){ document.getElementById('root').textContent='서버 응답 없음'; }); }
 load(); setInterval(load, 5000);
 </script></body></html>
 """
