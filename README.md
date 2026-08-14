@@ -53,6 +53,27 @@ Claude Code hook (Notification/Stop)
 - `assets/` — 펫 외형 이미지. 비어 있으면 내장 벡터 펫을 그린다.
 - `assets_sample/` — 규격 참고용 샘플 3종.
 
+## 세션 질문 보드
+
+같은 훅 파이프라인을 재활용하는 애드온. 답을 기다리는 세션이 **무엇을 묻고 있는지**를
+한 줄 요약 카드로 모아 보여준다.
+
+```
+events.jsonl (stop/notification)
+  → question_board.py  (tail → 세션 마지막 메시지 → haiku 요약)
+  → questions.json 저장 + events.jsonl에 말풍선 이벤트 append (펫이 표시)
+  → 웹 보드 http://127.0.0.1:8620
+```
+
+- `question_board.py` — 보드 서버. 요약은 `claude -p --model haiku`를 훅 없이 1회 호출한다.
+- `QuestionBoard.bat` — 콘솔에서 실행 + 브라우저 열기.
+- `QuestionBoardSilent.vbs` — 창 없이 기동. 시작프로그램에는 이 파일의 바로가기를 둔다.
+- `questions.json` — 요약 카드 저장소 (자동 생성).
+
+카드에 선택지가 있으면 클릭해서 복사할 수 있다. **답장은 보드에서 보내지 않는다** —
+현재 CLI에 실행 중인 세션으로 입력을 넣는 공식 경로가 없어서, v1은 읽기 전용이다.
+답장은 agent view(백그라운드 세션)나 해당 터미널에서 한다.
+
 ## 조작
 
 | 동작 | 효과 |

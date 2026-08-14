@@ -1,6 +1,7 @@
 # 실행 중 생기는 것들
 config.json
 events.jsonl
+questions.json
 pet_error.log
 __pycache__/
 *.pyc
