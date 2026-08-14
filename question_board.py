@@ -260,17 +260,63 @@ def tail_events():
 
 # ---------- 답장 ----------
 
-def send_reply(session_id, text):
-    """[보류] 보드에서 세션에 직접 답장 투입 — 현재 공식 경로 없음(2.1.232 실측).
+ROSTER = os.path.expanduser(r"~/.claude/daemon/roster.json")
 
-    조사 결과:
-    - `claude --resume=<sid>`: 데몬이 잡고 있는 bg 세션은 "currently running"으로 거부.
-    - daemon pty 파이프 직접 주입: 서버가 {"t":"auth-required"} 반환. control.key 기반
-      auth 프레임 후보 실패(HMAC 챌린지로 추정). 비공식 + 버전 취약.
-    - `claude attach/logs/stop <short>`: 힌트만 출력, 이 빌드엔 미구현.
-    → v1은 읽기전용. 답장은 agent view에서 Enter. 정식 attach CLI 나오면 여기 연결.
+
+def send_reply(session_id, text):
+    """대기(blocked/idle) 백그라운드 세션에 프롬프트를 주입한다.
+
+    데몬 rendezvous(rv) 소켓에 NDJSON 두 줄을 **한 버퍼로 원자 전송**한다:
+      {"proto":1,"role":"supervisor","supervisorPid":0,"auth":<rvAuth>}
+      {"type":"reply","text":<프롬프트>}
+    핵심: rv는 단일 연결이라 auth 뒤에 지연을 두면 데몬이 재접속하며 우리 소켓을
+    밀어내 reply write가 실패한다. 두 줄을 즉시 함께 보내야 한다.
+    (프로토콜은 claude.exe 2.1.232 리버스로 확정. ptyAuth/rvAuth는 roster에 워커별로 기록됨.)
     """
-    return False, "답장 자동전송 비활성(v1) — agent view에서 답장하세요"
+    text = (text or "").strip()
+    if not text:
+        return False, "빈 메시지"
+    short = (session_id or "")[:8]
+    try:
+        r = json.load(open(ROSTER, encoding="utf-8"))
+        w = r["workers"][short]
+        pipe, rv_auth = w["rendezvousSock"], w["rvAuth"]
+    except Exception as e:
+        return False, f"세션을 roster에서 찾지 못함: {e}"
+
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.windll.kernel32
+    auth = json.dumps({"proto": 1, "role": "supervisor", "supervisorPid": 0,
+                       "auth": rv_auth}, ensure_ascii=False)
+    reply = json.dumps({"type": "reply", "text": text}, ensure_ascii=False)
+    payload = (auth + "\n" + reply + "\n").encode("utf-8")
+
+    h = k32.CreateFileW(pipe, 0xC0000000, 0, None, 3, 0, None)
+    if h in (-1, wintypes.HANDLE(-1).value):
+        return False, f"rv 소켓 연결 실패 (err {k32.GetLastError()})"
+    try:
+        n = wintypes.DWORD(0)
+        ok = k32.WriteFile(h, payload, len(payload), ctypes.byref(n), None)
+        k32.FlushFileBuffers(h)
+        # reply-rejected(인증 실패) 여부 잠깐 확인
+        time.sleep(0.4)
+        avail = wintypes.DWORD(0)
+        k32.PeekNamedPipe(h, None, 0, None, ctypes.byref(avail), None)
+        resp = b""
+        if avail.value:
+            buf = ctypes.create_string_buffer(min(avail.value, 4096))
+            rn = wintypes.DWORD(0)
+            k32.ReadFile(h, buf, len(buf), ctypes.byref(rn), None)
+            resp = buf.raw[:rn.value]
+    finally:
+        k32.CloseHandle(h)
+
+    if not ok or n.value != len(payload):
+        return False, f"전송 실패 (wrote {n.value}/{len(payload)})"
+    if b"auth-rejected" in resp or b"reply-rejected" in resp:
+        return False, "인증/전송 거부 — 세션이 재시작됐을 수 있음(토큰 갱신)"
+    return True, "전송됨"
 
 
 # ---------- 웹 ----------
